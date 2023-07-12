@@ -9,6 +9,7 @@ import {
 import { customElement, property, state, query } from "lit/decorators";
 import { isComponentLoaded } from "../common/config/is_component_loaded";
 import { fireEvent } from "../common/dom/fire_event";
+import { debounce } from "../common/util/debounce";
 import { handleWebRtcOffer, WebRtcAnswer } from "../data/camera";
 import { fetchWebRtcSettings } from "../data/rtsp_to_webrtc";
 import type { HomeAssistant } from "../types";
@@ -107,32 +108,6 @@ class HaWebRtcPlayer extends LitElement {
     );
     await peerConnection.setLocalDescription(offer);
 
-    let candidates = ""; // Build an Offer SDP string with ice candidates
-    const iceResolver = new Promise<void>((resolve) => {
-      peerConnection.addEventListener("icecandidate", async (event) => {
-        if (!event.candidate) {
-          resolve(); // Gathering complete
-          return;
-        }
-        candidates += `a=${event.candidate.candidate}\r\n`;
-      });
-    });
-    await iceResolver;
-    const offer_sdp = offer.sdp! + candidates;
-
-    let webRtcAnswer: WebRtcAnswer;
-    try {
-      webRtcAnswer = await handleWebRtcOffer(
-        this.hass,
-        this.entityid,
-        offer_sdp
-      );
-    } catch (err: any) {
-      this._error = "Failed to start WebRTC stream: " + err.message;
-      peerConnection.close();
-      return;
-    }
-
     // Setup callbacks to render remote stream once media tracks are discovered.
     const remoteStream = new MediaStream();
     peerConnection.addEventListener("track", (event) => {
@@ -141,18 +116,51 @@ class HaWebRtcPlayer extends LitElement {
     });
     this._remoteStream = remoteStream;
 
-    // Initiate the stream with the remote device
-    const remoteDesc = new RTCSessionDescription({
-      type: "answer",
-      sdp: webRtcAnswer.answer,
+    const sendOffer = debounce(async () => {
+      const offer_sdp = offer.sdp! + candidates;
+      let webRtcAnswer: WebRtcAnswer;
+      try {
+        webRtcAnswer = await handleWebRtcOffer(
+          this.hass,
+          this.entityid,
+          offer_sdp
+        );
+      } catch (err: any) {
+        this._error = "Failed to start WebRTC stream: " + err.message;
+        // this._peerConnection.close();
+        return;
+      }
+
+      if (peerConnection.connectionState === "connected") {
+        return;
+      }
+
+      // Initiate the stream with the remote device
+      const remoteDesc = new RTCSessionDescription({
+        type: "answer",
+        sdp: webRtcAnswer.answer,
+      });
+      try {
+        await peerConnection.setRemoteDescription(remoteDesc);
+      } catch (err: any) {
+        this._error = "Failed to connect WebRTC stream: " + err.message;
+        // this._peerConnection.close();
+        return;
+      }
+
+      this._peerConnection = peerConnection;
+    }, 250);
+
+    let candidates = ""; // Build an Offer SDP string with ice candidates
+    peerConnection.addEventListener("icecandidate", async (event) => {
+      if (!event.candidate) {
+        return;
+      }
+
+      candidates += `a=${event.candidate.candidate}\r\n`;
+      sendOffer();
     });
-    try {
-      await peerConnection.setRemoteDescription(remoteDesc);
-    } catch (err: any) {
-      this._error = "Failed to connect WebRTC stream: " + err.message;
-      peerConnection.close();
-      return;
-    }
+
     this._peerConnection = peerConnection;
   }
 
